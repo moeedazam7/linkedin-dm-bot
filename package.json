@@ -1,0 +1,12 @@
+{
+  "name": "linkedin-dm-bot",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "linkedin-private-api": "^3.2.1"
+  }
+}
