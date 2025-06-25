@@ -27,6 +27,7 @@ app.post("/send-linkedin-message", async (req, res) => {
     console.log("Logging into LinkedIn...");
     await client.login.userCookie({
       li_at: li_at_cookie,
+     JSESSIONID: "ajax:2598998097955601105", 
       cookieCsrfToken: "", // Required to disable cache fallback
       useCache: false
     });
