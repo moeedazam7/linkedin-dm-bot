@@ -9,7 +9,7 @@ app.post("/send-linkedin-message", async (req, res) => {
 
   try {
     const client = new Client();
-    await client.login.userCookie({ li_at: li_at_cookie });
+    await client.login.userCookie({ li_at: li_at_cookie, useCache: false, });
 
     await client.message.sendText(recipientProfileId, message);
 
