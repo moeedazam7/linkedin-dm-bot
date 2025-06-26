@@ -24,9 +24,9 @@ app.post("/send-linkedin-message", async (req, res) => {
       useCache: false,
     });
 
-    await client.message.sendMessage({
+    await client.invitation.sendInvitation({
       profileId: recipientProfileId,
-      text: message,
+      message,
     });
 
     res.status(200).json({ success: true, to: recipientProfileId });
