@@ -397,20 +397,19 @@ export default function Home() {
   }
 
   function exportApproved() {
-    const approvedRows = prospects
-      .map((row) => {
-        const decision = reviews[prospectId(row)];
-        if (decision?.status !== "Approved") {
-          return null;
-        }
+    const approvedRows = prospects.reduce<ProspectRow[]>((rows, row) => {
+      const decision = reviews[prospectId(row)];
+      if (decision?.status !== "Approved") {
+        return rows;
+      }
 
-        return {
-          ...row,
-          review_status: decision.status,
-          reviewed_at: decision.reviewedAt ?? "",
-        };
-      })
-      .filter((row): row is ProspectRow => row !== null);
+      rows.push({
+        ...row,
+        review_status: decision.status,
+        reviewed_at: decision.reviewedAt ?? "",
+      });
+      return rows;
+    }, []);
 
     if (approvedRows.length === 0) {
       setNotice("No approved prospects to export yet.");
