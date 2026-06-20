@@ -33,6 +33,15 @@ const SORT_OPTIONS = [
   "Network Effect",
 ] as const;
 
+const NUMERIC_COLUMNS = new Set<RequiredColumn>([
+  "Mission Alignment",
+  "Network Effect",
+  "High-Stakes Email Need",
+  "Evidence Strength",
+  "New Rank",
+  "Revised Score",
+]);
+
 const REVIEW_STATUSES = [
   "Unreviewed",
   "Approved",
@@ -40,10 +49,11 @@ const REVIEW_STATUSES = [
   "Rejected",
 ] as const;
 
-type ProspectRow = Record<string, string>;
 type RequiredColumn = (typeof REQUIRED_COLUMNS)[number];
 type SortOption = (typeof SORT_OPTIONS)[number];
 type ReviewStatus = (typeof REVIEW_STATUSES)[number];
+type CsvCell = string | number;
+type ProspectRow = Record<string, CsvCell>;
 
 type ReviewDecision = {
   status: ReviewStatus;
@@ -138,18 +148,18 @@ function makeSampleProspects(): ProspectRow[] {
       Company: entry.company,
       "Job Title": entry.title,
       Segment: entry.segment,
-      "Mission Alignment": String(mission),
-      "Network Effect": String(network),
-      "High-Stakes Email Need": String(highStakes),
-      "Evidence Strength": String(evidence),
+      "Mission Alignment": mission,
+      "Network Effect": network,
+      "High-Stakes Email Need": highStakes,
+      "Evidence Strength": evidence,
       "Exact Public Signal": `${entry.person} ${signal}.`,
       "Source URL": `https://example.com/signals/${personSlug(entry.person)}`,
       "Direct Evidence": `${entry.person} has publicly discussed ${signal.replace("published ", "").replace("posted about ", "")} and owns a relationship-heavy GTM motion.`,
       "Inferred Use Case": `Use Lightfern to turn warm network context into credible, high-trust outreach for ${entry.segment.toLowerCase()} buyers and partners.`,
       "Outreach Angle": `Lead with the public signal, then offer a concise champion workflow that helps ${entry.company} activate warm introductions without generic sequencing.`,
       "Preferred Channel": hasEmail ? "Email" : "LinkedIn",
-      "New Rank": String(index + 1),
-      "Revised Score": String(score),
+      "New Rank": index + 1,
+      "Revised Score": score,
       "Qualification Tier": tier,
       "Position Reason": `${tier} because the role combines mission alignment, network leverage, email urgency, and verifiable public evidence.`,
     };
@@ -157,6 +167,20 @@ function makeSampleProspects(): ProspectRow[] {
 }
 
 const INITIAL_PROSPECTS = makeSampleProspects();
+
+function normalizeHeader(header: string) {
+  return header.replace(/^\uFEFF/, "").trim();
+}
+
+function normalizeCsvCell(column: string, cell: unknown): CsvCell {
+  const trimmed = String(cell ?? "").trim();
+  if (!NUMERIC_COLUMNS.has(column as RequiredColumn)) {
+    return trimmed;
+  }
+
+  const numeric = Number(trimmed);
+  return trimmed !== "" && Number.isFinite(numeric) ? numeric : "";
+}
 
 function value(row: ProspectRow, column: RequiredColumn) {
   return String(row[column] ?? "").trim();
@@ -340,6 +364,15 @@ export default function Home() {
     setSortBy("New Rank");
   }
 
+  function resetToSampleData() {
+    setProspects(INITIAL_PROSPECTS);
+    setSourceName("Sample fallback data");
+    setSelectedId(prospectId(INITIAL_PROSPECTS[0]));
+    resetFilters();
+    setValidationError("");
+    setNotice("Sample fallback data restored.");
+  }
+
   function handleCsvUpload(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     setNotice("");
@@ -352,9 +385,19 @@ export default function Home() {
     Papa.parse<ProspectRow>(file, {
       header: true,
       skipEmptyLines: "greedy",
-      transformHeader: (header) => header.replace(/^\uFEFF/, "").trim(),
+      transformHeader: normalizeHeader,
       complete: (results) => {
-        const fields = results.meta.fields?.map((field) => field.trim()).filter(Boolean) ?? [];
+        const fields = results.meta.fields?.map(normalizeHeader).filter(Boolean) ?? [];
+        console.log("Lightfern CSV parsed headers:", fields);
+        console.log("Lightfern CSV first parsed row:", results.data[0] ?? null);
+
+        const blockingParseErrors = results.errors.filter((error) => error.type !== "FieldMismatch");
+        if (blockingParseErrors.length > 0) {
+          setValidationError(`Could not parse CSV: ${blockingParseErrors[0]?.message ?? "Unknown parsing error"}.`);
+          event.target.value = "";
+          return;
+        }
+
         const missingColumns = REQUIRED_COLUMNS.filter((column) => !fields.includes(column));
 
         if (missingColumns.length > 0) {
@@ -368,7 +411,7 @@ export default function Home() {
           .map((row) => {
             const normalized: ProspectRow = {};
             fields.forEach((field) => {
-              normalized[field] = String(row[field] ?? "").trim();
+              normalized[field] = normalizeCsvCell(field, row[field]);
             });
             REQUIRED_COLUMNS.forEach((column) => {
               normalized[column] = normalized[column] ?? "";
@@ -386,7 +429,7 @@ export default function Home() {
         setSourceName(file.name);
         setSelectedId(prospectId(rows[0]));
         resetFilters();
-        setNotice(`${rows.length} prospects imported from ${file.name}.`);
+        setNotice(`${rows.length} prospects imported successfully.`);
         event.target.value = "";
       },
       error: (error) => {
@@ -486,6 +529,13 @@ export default function Home() {
                     Import CSV
                     <input className="sr-only" type="file" accept=".csv,text/csv" onChange={handleCsvUpload} />
                   </label>
+                  <button
+                    type="button"
+                    onClick={resetToSampleData}
+                    className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-950"
+                  >
+                    Reset to sample data
+                  </button>
                   <button
                     type="button"
                     onClick={exportApproved}
@@ -752,7 +802,7 @@ function ProspectDrawer({
         <DetailBlock title="Exact public signal" body={value(prospect, "Exact Public Signal")} />
         <DetailBlock title="Direct evidence" body={value(prospect, "Direct Evidence")} />
         <DetailBlock title="Inferred Lightfern use case" body={value(prospect, "Inferred Use Case")} />
-        <DetailBlock title="Position reason" body={value(prospect, "Position Reason")} />
+        <DetailBlock title="Ranking explanation" body={value(prospect, "Position Reason")} />
         <DetailBlock title="Outreach angle" body={value(prospect, "Outreach Angle")} />
 
         <div className="mt-5 grid gap-3">
