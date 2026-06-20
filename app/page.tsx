@@ -2,6 +2,8 @@
 
 import Papa from "papaparse";
 import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import type { FullEnrichEmailStatus, FullEnrichStatus, NormalizedFullEnrichRecord } from "@/lib/providers/fullenrich";
+import type { QualificationResult } from "@/lib/qualification";
 
 const REQUIRED_COLUMNS = [
   "Person",
@@ -54,10 +56,35 @@ type SortOption = (typeof SORT_OPTIONS)[number];
 type ReviewStatus = (typeof REVIEW_STATUSES)[number];
 type CsvCell = string | number;
 type ProspectRow = Record<string, CsvCell>;
+type EnrichmentUiStatus =
+  | "Not started"
+  | "Enrichment queued"
+  | "Enriching"
+  | "Enriched"
+  | "Probably valid email"
+  | "No valid email found"
+  | "Insufficient credits"
+  | "Failed"
+  | "Timed out";
+type CrmStatus = "Not ready" | "Ready for CRM" | "Sending" | "Sent to Zero" | "Failed" | "Retry";
 
 type ReviewDecision = {
   status: ReviewStatus;
   reviewedAt?: string;
+};
+
+type EnrichmentState = {
+  status: EnrichmentUiStatus;
+  enrichmentId?: string;
+  message?: string;
+  progress?: string;
+};
+
+type CrmState = {
+  status: CrmStatus;
+  message?: string;
+  sentAt?: string;
+  isDemo?: boolean;
 };
 
 type SamplePerson = {
@@ -142,6 +169,7 @@ function makeSampleProspects(): ProspectRow[] {
     const signal = MISSION_SIGNALS[index % MISSION_SIGNALS.length];
 
     return {
+      __prospect_id: `sample-${index + 1}`,
       Person: entry.person,
       Email: hasEmail ? `${firstName}.${lastName}@${companySlug(entry.company)}.com` : "",
       "LinkedIn URL": `https://www.linkedin.com/in/${personSlug(entry.person)}`,
@@ -192,11 +220,23 @@ function numericValue(row: ProspectRow, column: RequiredColumn) {
 }
 
 function prospectId(row: ProspectRow) {
+  const internalId = String(row.__prospect_id ?? "").trim();
+  if (internalId) {
+    return internalId;
+  }
+
   return (
     value(row, "Email").toLowerCase() ||
     value(row, "LinkedIn URL").toLowerCase() ||
     `${value(row, "Person")}-${value(row, "Company")}`.toLowerCase()
   );
+}
+
+function withProspectId(row: ProspectRow, index: number, prefix: string) {
+  return {
+    ...row,
+    __prospect_id: String(row.__prospect_id ?? `${prefix}-${index + 1}`),
+  };
 }
 
 function uniqueValues(rows: ProspectRow[], column: RequiredColumn) {
@@ -251,8 +291,69 @@ function reviewBadgeClass(status: ReviewStatus) {
   return "border-slate-200 bg-white text-slate-500";
 }
 
+function statusPillClass(status: string) {
+  const normalized = status.toLowerCase();
+  if (normalized.includes("sent") || normalized.includes("ready") || normalized.includes("enriched") || normalized === "valid") {
+    return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  }
+  if (normalized.includes("probably") || normalized.includes("queued") || normalized.includes("enriching") || normalized.includes("caution")) {
+    return "border-amber-200 bg-amber-50 text-amber-800";
+  }
+  if (normalized.includes("failed") || normalized.includes("invalid") || normalized.includes("insufficient") || normalized.includes("timed")) {
+    return "border-rose-200 bg-rose-50 text-rose-800";
+  }
+  return "border-slate-200 bg-white text-slate-500";
+}
+
+function emailStatusLabel(status?: FullEnrichEmailStatus) {
+  if (status === "valid") return "Valid";
+  if (status === "probably_valid") return "Probably valid";
+  if (status === "invalid") return "Invalid";
+  return "Not found";
+}
+
+function enrichmentUiStatusFromProvider(record: NormalizedFullEnrichRecord): EnrichmentUiStatus {
+  if (record.status === "insufficient_credit") return "Insufficient credits";
+  if (record.status === "failed" || record.status === "cancelled") return "Failed";
+  if (record.status === "queued") return "Enrichment queued";
+  if (record.status === "processing") return "Enriching";
+  if (record.emailStatus === "valid") return "Enriched";
+  if (record.emailStatus === "probably_valid") return "Probably valid email";
+  return "No valid email found";
+}
+
+function finalScoreFor(id: string, prospect: ProspectRow, qualifications: Record<string, QualificationResult>) {
+  return qualifications[id]?.finalScore ?? "";
+}
+
+function finalTierFor(id: string, prospect: ProspectRow, qualifications: Record<string, QualificationResult>) {
+  return qualifications[id]?.qualificationTier ?? value(prospect, "Qualification Tier");
+}
+
+function finalPreferredChannelFor(id: string, prospect: ProspectRow, qualifications: Record<string, QualificationResult>) {
+  return qualifications[id]?.preferredChannel ?? effectiveChannel(prospect);
+}
+
+function isReadyForCrm(id: string, reviews: Record<string, ReviewDecision>, qualifications: Record<string, QualificationResult>) {
+  return reviews[id]?.status === "Approved" && Boolean(qualifications[id]);
+}
+
+function validEmailForZero(unifyRecord: ProspectRow | undefined, record: NormalizedFullEnrichRecord | undefined) {
+  if (record?.workEmail && record.emailStatus === "valid") return record.workEmail;
+  const unifyEmail = unifyRecord ? value(unifyRecord, "Email") : "";
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(unifyEmail) ? unifyEmail : "";
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function downloadCsv(filename: string, rows: ProspectRow[]) {
-  const csv = Papa.unparse(rows);
+  const csv = Papa.unparse(
+    rows.map((row) =>
+      Object.fromEntries(Object.entries(row).filter(([key]) => !key.startsWith("__"))),
+    ),
+  );
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -266,6 +367,7 @@ function downloadCsv(filename: string, rows: ProspectRow[]) {
 
 export default function Home() {
   const [prospects, setProspects] = useState<ProspectRow[]>(INITIAL_PROSPECTS);
+  const [unifyProspects, setUnifyProspects] = useState<ProspectRow[]>(INITIAL_PROSPECTS);
   const [sourceName, setSourceName] = useState("Sample fallback data");
   const [selectedId, setSelectedId] = useState(prospectId(INITIAL_PROSPECTS[0]));
   const [tierFilter, setTierFilter] = useState("All");
@@ -275,8 +377,14 @@ export default function Home() {
   const [minimumScore, setMinimumScore] = useState(0);
   const [sortBy, setSortBy] = useState<SortOption>("New Rank");
   const [reviews, setReviews] = useState<Record<string, ReviewDecision>>({});
+  const [enrichmentStates, setEnrichmentStates] = useState<Record<string, EnrichmentState>>({});
+  const [fullEnrichRecords, setFullEnrichRecords] = useState<Record<string, NormalizedFullEnrichRecord>>({});
+  const [qualificationResults, setQualificationResults] = useState<Record<string, QualificationResult>>({});
+  const [crmStates, setCrmStates] = useState<Record<string, CrmState>>({});
   const [validationError, setValidationError] = useState("");
   const [notice, setNotice] = useState("");
+  const [demoMode, setDemoMode] = useState(true);
+  const [batchRunning, setBatchRunning] = useState(false);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("lightfern-review-decisions");
@@ -299,59 +407,106 @@ export default function Home() {
     () => prospects.find((prospect) => prospectId(prospect) === selectedId) ?? prospects[0],
     [prospects, selectedId],
   );
+  const selectedUnifyProspect = useMemo(
+    () => unifyProspects.find((prospect) => prospectId(prospect) === selectedId) ?? selectedProspect,
+    [selectedId, selectedProspect, unifyProspects],
+  );
 
   const summary = useMemo(
     () => ({
-      analysed: prospects.length,
-      priority: prospects.filter((row) => value(row, "Qualification Tier").toLowerCase().includes("priority")).length,
-      strong: prospects.filter((row) => value(row, "Qualification Tier").toLowerCase().includes("strong")).length,
-      emailReady: prospects.filter((row) => Boolean(value(row, "Email"))).length,
-      linkedinOnly: prospects.filter((row) => !value(row, "Email") && Boolean(value(row, "LinkedIn URL"))).length,
+      imported: prospects.length,
+      pendingEnrichment: prospects.filter((row) => !fullEnrichRecords[prospectId(row)]).length,
+      enriched: prospects.filter((row) => Boolean(fullEnrichRecords[prospectId(row)])).length,
+      readyForCrm: prospects.filter((row) => {
+        const id = prospectId(row);
+        return isReadyForCrm(id, reviews, qualificationResults) && crmStates[id]?.status !== "Sent to Zero";
+      }).length,
+      sentToZero: prospects.filter((row) => crmStates[prospectId(row)]?.status === "Sent to Zero").length,
+      missingValidEmail: prospects.filter((row) => {
+        const id = prospectId(row);
+        const unifyRecord = unifyProspects.find((prospect) => prospectId(prospect) === id);
+        return !validEmailForZero(unifyRecord, fullEnrichRecords[id]);
+      }).length,
     }),
-    [prospects],
+    [crmStates, fullEnrichRecords, prospects, qualificationResults, reviews, unifyProspects],
   );
 
   const filters = useMemo(
     () => ({
-      tiers: uniqueValues(prospects, "Qualification Tier"),
+      tiers: Array.from(
+        new Set(
+          prospects
+            .map((prospect) => finalTierFor(prospectId(prospect), prospect, qualificationResults))
+            .filter(Boolean),
+        ),
+      ).sort((a, b) => a.localeCompare(b)),
       segments: uniqueValues(prospects, "Segment"),
-      channels: Array.from(new Set(prospects.map(effectiveChannel).filter(Boolean))).sort((a, b) =>
-        a.localeCompare(b),
-      ),
+      channels: Array.from(
+        new Set(
+          prospects
+            .map((prospect) => finalPreferredChannelFor(prospectId(prospect), prospect, qualificationResults))
+            .filter(Boolean),
+        ),
+      ).sort((a, b) => a.localeCompare(b)),
     }),
-    [prospects],
+    [prospects, qualificationResults],
   );
 
   const filteredProspects = useMemo(() => {
     return [...prospects]
-      .filter((row) => tierFilter === "All" || value(row, "Qualification Tier") === tierFilter)
+      .filter((row) => {
+        const id = prospectId(row);
+        return tierFilter === "All" || finalTierFor(id, row, qualificationResults) === tierFilter;
+      })
       .filter((row) => segmentFilter === "All" || value(row, "Segment") === segmentFilter)
-      .filter((row) => channelFilter === "All" || effectiveChannel(row) === channelFilter)
+      .filter((row) => {
+        const id = prospectId(row);
+        return channelFilter === "All" || finalPreferredChannelFor(id, row, qualificationResults) === channelFilter;
+      })
       .filter((row) => {
         const status = reviews[prospectId(row)]?.status ?? "Unreviewed";
         return statusFilter === "All" || status === statusFilter;
       })
-      .filter((row) => numericValue(row, "Revised Score") >= minimumScore)
+      .filter((row) => {
+        const id = prospectId(row);
+        return Number(finalScoreFor(id, row, qualificationResults) || numericValue(row, "Revised Score")) >= minimumScore;
+      })
       .sort((a, b) => {
         if (sortBy === "New Rank") {
           return numericValue(a, sortBy) - numericValue(b, sortBy);
         }
         return numericValue(b, sortBy) - numericValue(a, sortBy);
       });
-  }, [channelFilter, minimumScore, prospects, reviews, segmentFilter, sortBy, statusFilter, tierFilter]);
+  }, [channelFilter, minimumScore, prospects, qualificationResults, reviews, segmentFilter, sortBy, statusFilter, tierFilter]);
 
   function setDecision(status: ReviewStatus) {
     if (!selectedProspect) {
       return;
     }
 
+    const id = prospectId(selectedProspect);
+    if (status === "Approved" && !qualificationResults[id]) {
+      setValidationError("Qualification validation must complete before approval.");
+      return;
+    }
+
     setReviews((current) => ({
       ...current,
-      [prospectId(selectedProspect)]: {
+      [id]: {
         status,
         reviewedAt: new Date().toISOString(),
       },
     }));
+    if (status === "Approved") {
+      setCrmStates((current) => ({
+        ...current,
+        [id]: {
+          status: "Ready for CRM",
+          message: "Human approved. Send to Zero is now available.",
+        },
+      }));
+    }
+    setValidationError("");
     setNotice(`${value(selectedProspect, "Person") || "Prospect"} marked as ${status}.`);
   }
 
@@ -366,11 +521,265 @@ export default function Home() {
 
   function resetToSampleData() {
     setProspects(INITIAL_PROSPECTS);
+    setUnifyProspects(INITIAL_PROSPECTS);
     setSourceName("Sample fallback data");
     setSelectedId(prospectId(INITIAL_PROSPECTS[0]));
     resetFilters();
+    setEnrichmentStates({});
+    setFullEnrichRecords({});
+    setQualificationResults({});
+    setCrmStates({});
     setValidationError("");
     setNotice("Sample fallback data restored.");
+  }
+
+  function prospectPayload(prospect: ProspectRow, unifyRecord = prospect) {
+    const person = value(unifyRecord, "Person");
+    const [firstName = "", ...lastParts] = person.split(/\s+/).filter(Boolean);
+    return {
+      prospectId: prospectId(prospect),
+      person,
+      firstName,
+      lastName: lastParts.join(" "),
+      email: value(unifyRecord, "Email"),
+      company: value(unifyRecord, "Company"),
+      companyDomain: String(unifyRecord["Company Domain"] ?? ""),
+      jobTitle: value(unifyRecord, "Job Title"),
+      linkedinUrl: value(unifyRecord, "LinkedIn URL"),
+    };
+  }
+
+  function mergeFullEnrichRecord(id: string, record: NormalizedFullEnrichRecord) {
+    setProspects((current) =>
+      current.map((prospect) => {
+        if (prospectId(prospect) !== id) {
+          return prospect;
+        }
+
+        return {
+          ...prospect,
+          Email: record.workEmail && record.emailStatus === "valid" ? record.workEmail : prospect.Email,
+          "LinkedIn URL": record.linkedinUrl || prospect["LinkedIn URL"],
+          "Job Title": record.jobTitle || prospect["Job Title"],
+          Company: record.company || prospect.Company,
+          "Company Domain": record.companyDomain || prospect["Company Domain"] || "",
+          "FullEnrich Email Status": record.emailStatus,
+        };
+      }),
+    );
+  }
+
+  async function pollFullEnrichStatus(id: string, enrichmentId: string) {
+    for (let attempt = 1; attempt <= 30; attempt += 1) {
+      await sleep(3000);
+      setEnrichmentStates((current) => ({
+        ...current,
+        [id]: {
+          ...current[id],
+          status: "Enriching",
+          progress: `Polling FullEnrich (${attempt}/30)`,
+        },
+      }));
+
+      const response = await fetch(`/api/fullenrich/status?enrichmentId=${encodeURIComponent(enrichmentId)}&prospectId=${encodeURIComponent(id)}`);
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error ?? "FullEnrich status polling failed.");
+      }
+
+      const record = result.data as NormalizedFullEnrichRecord;
+      const uiStatus = enrichmentUiStatusFromProvider(record);
+      setEnrichmentStates((current) => ({
+        ...current,
+        [id]: {
+          ...current[id],
+          status: uiStatus,
+          enrichmentId,
+          message: record.isDemo ? "Simulated demo data" : undefined,
+        },
+      }));
+
+      if (["completed", "failed", "cancelled", "insufficient_credit"].includes(record.status)) {
+        if (record.status === "completed") {
+          setFullEnrichRecords((current) => ({ ...current, [id]: record }));
+          mergeFullEnrichRecord(id, record);
+        }
+        return record;
+      }
+    }
+
+    setEnrichmentStates((current) => ({
+      ...current,
+      [id]: {
+        ...current[id],
+        status: "Timed out",
+        message: "FullEnrich polling timed out after 90 seconds. Retry is available.",
+      },
+    }));
+    return null;
+  }
+
+  async function enrichProspect(prospect: ProspectRow, shouldRequalify: boolean) {
+    const id = prospectId(prospect);
+    const unifyRecord = unifyProspects.find((row) => prospectId(row) === id) ?? prospect;
+    setValidationError("");
+    setNotice("");
+    setEnrichmentStates((current) => ({
+      ...current,
+      [id]: { status: "Enrichment queued", message: demoMode ? "Simulated demo data" : undefined },
+    }));
+
+    try {
+      const response = await fetch("/api/fullenrich/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...prospectPayload(prospect, unifyRecord), demoMode }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error ?? "Could not start FullEnrich enrichment.");
+      }
+
+      const enrichmentId = String(result.enrichmentId);
+      setEnrichmentStates((current) => ({
+        ...current,
+        [id]: { status: "Enriching", enrichmentId, message: result.demoMode ? "Simulated demo data" : undefined },
+      }));
+
+      const record = await pollFullEnrichStatus(id, enrichmentId);
+      if (!record || record.status !== "completed") {
+        return null;
+      }
+
+      if (shouldRequalify) {
+        await requalifyProspect(prospect, record);
+      }
+
+      return record;
+    } catch (error) {
+      setEnrichmentStates((current) => ({
+        ...current,
+        [id]: {
+          ...current[id],
+          status: "Failed",
+          message: error instanceof Error ? error.message : "FullEnrich enrichment failed.",
+        },
+      }));
+      return null;
+    }
+  }
+
+  async function requalifyProspect(prospect: ProspectRow, overrideFullEnrichRecord?: NormalizedFullEnrichRecord) {
+    const id = prospectId(prospect);
+    const unifyRecord = unifyProspects.find((row) => prospectId(row) === id) ?? prospect;
+    const fullEnrichRecord = overrideFullEnrichRecord ?? fullEnrichRecords[id] ?? null;
+
+    try {
+      const response = await fetch("/api/qualify-prospect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ unifyRecord, fullEnrichRecord, demoMode }),
+      });
+      const qualification = (await response.json()) as QualificationResult & { error?: string };
+      if (!response.ok) {
+        throw new Error(qualification.error ?? "Could not qualify prospect.");
+      }
+
+      setQualificationResults((current) => ({ ...current, [id]: qualification }));
+      setProspects((current) =>
+        current.map((row) =>
+          prospectId(row) === id
+            ? {
+                ...row,
+                "Final Score": qualification.finalScore,
+                "Final Qualification Tier": qualification.qualificationTier,
+                "Preferred Channel": qualification.preferredChannel,
+                "Position Reason": qualification.scoreChangeReason,
+                "Inferred Use Case": qualification.lightfernUseCase,
+                "Outreach Angle": qualification.outreachAngle,
+              }
+            : row,
+        ),
+      );
+      setNotice(`${value(unifyRecord, "Person") || "Prospect"} qualified with final score ${qualification.finalScore}.`);
+      return qualification;
+    } catch (error) {
+      setValidationError(error instanceof Error ? error.message : "Could not qualify prospect.");
+      return null;
+    }
+  }
+
+  async function sendToZero(prospect: ProspectRow) {
+    const id = prospectId(prospect);
+    const unifyRecord = unifyProspects.find((row) => prospectId(row) === id) ?? prospect;
+    const qualification = qualificationResults[id];
+
+    if (!isReadyForCrm(id, reviews, qualificationResults)) {
+      setCrmStates((current) => ({
+        ...current,
+        [id]: { status: "Not ready", message: "Enrichment, qualification, and approval are required before Zero routing." },
+      }));
+      return;
+    }
+
+    setCrmStates((current) => ({ ...current, [id]: { status: "Sending" } }));
+
+    try {
+      const response = await fetch("/api/send-to-zero", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          unifyRecord,
+          fullEnrichRecord: fullEnrichRecords[id] ?? null,
+          qualification,
+          demoMode,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error ?? "Zero CRM routing failed.");
+      }
+
+      setCrmStates((current) => ({
+        ...current,
+        [id]: {
+          status: "Sent to Zero",
+          message: result.message ?? "Prospect enriched, qualified, and routed to Zero CRM.",
+          sentAt: new Date().toISOString(),
+          isDemo: Boolean(result.demoMode),
+        },
+      }));
+      setNotice("Prospect enriched, qualified, and routed to Zero CRM.");
+    } catch (error) {
+      setCrmStates((current) => ({
+        ...current,
+        [id]: {
+          status: "Failed",
+          message: error instanceof Error ? error.message : "Zero CRM routing failed.",
+        },
+      }));
+    }
+  }
+
+  async function enrichPriorityChampions() {
+    if (batchRunning) {
+      return;
+    }
+
+    setBatchRunning(true);
+    const priorityProspects = prospects.filter((prospect) =>
+      finalTierFor(prospectId(prospect), prospect, qualificationResults).toLowerCase().includes("priority"),
+    );
+
+    for (const prospect of priorityProspects) {
+      const id = prospectId(prospect);
+      if (fullEnrichRecords[id]) {
+        continue;
+      }
+      await enrichProspect(prospect, true);
+    }
+
+    setBatchRunning(false);
   }
 
   function handleCsvUpload(event: ChangeEvent<HTMLInputElement>) {
@@ -408,7 +817,7 @@ export default function Home() {
 
         const rows = results.data
           .filter((row) => fields.some((field) => String(row[field] ?? "").trim() !== ""))
-          .map((row) => {
+          .map((row, index) => {
             const normalized: ProspectRow = {};
             fields.forEach((field) => {
               normalized[field] = normalizeCsvCell(field, row[field]);
@@ -416,7 +825,7 @@ export default function Home() {
             REQUIRED_COLUMNS.forEach((column) => {
               normalized[column] = normalized[column] ?? "";
             });
-            return normalized;
+            return withProspectId(normalized, index, "csv");
           });
 
         if (rows.length === 0) {
@@ -426,9 +835,15 @@ export default function Home() {
         }
 
         setProspects(rows);
+        setUnifyProspects(rows);
         setSourceName(file.name);
         setSelectedId(prospectId(rows[0]));
         resetFilters();
+        setEnrichmentStates({});
+        setFullEnrichRecords({});
+        setQualificationResults({});
+        setCrmStates({});
+        setReviews({});
         setNotice(`${rows.length} prospects imported successfully.`);
         event.target.value = "";
       },
@@ -499,13 +914,14 @@ export default function Home() {
           </div>
         </header>
 
-        <section className="grid gap-4 md:grid-cols-5">
+        <section className="grid gap-4 md:grid-cols-3 xl:grid-cols-6">
           {[
-            { label: "prospects analysed", value: summary.analysed },
-            { label: "Priority Champions", value: summary.priority },
-            { label: "Strong Prospects", value: summary.strong },
-            { label: "email-ready", value: summary.emailReady },
-            { label: "LinkedIn-only", value: summary.linkedinOnly },
+            { label: "Prospects imported", value: summary.imported },
+            { label: "Pending enrichment", value: summary.pendingEnrichment },
+            { label: "Enriched by FullEnrich", value: summary.enriched },
+            { label: "Ready for CRM", value: summary.readyForCrm },
+            { label: "Sent to Zero", value: summary.sentToZero },
+            { label: "Missing valid email", value: summary.missingValidEmail },
           ].map((card) => (
             <div key={card.label} className="rounded-3xl border border-white/70 bg-white/80 p-5 shadow-lg shadow-emerald-950/5">
               <div className="text-3xl font-semibold tracking-tight text-slate-950">{card.value}</div>
@@ -525,10 +941,27 @@ export default function Home() {
                   </p>
                 </div>
                 <div className="flex flex-col gap-3 sm:flex-row">
+                  <label className="inline-flex items-center justify-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-4 py-2 text-sm font-semibold text-amber-800">
+                    <input
+                      type="checkbox"
+                      checked={demoMode}
+                      onChange={(event) => setDemoMode(event.target.checked)}
+                      className="accent-amber-600"
+                    />
+                    Demo mode
+                  </label>
                   <label className="inline-flex cursor-pointer items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-800 transition hover:bg-emerald-100">
                     Import CSV
                     <input className="sr-only" type="file" accept=".csv,text/csv" onChange={handleCsvUpload} />
                   </label>
+                  <button
+                    type="button"
+                    onClick={enrichPriorityChampions}
+                    disabled={batchRunning}
+                    className="rounded-full border border-teal-200 bg-teal-50 px-4 py-2 text-sm font-semibold text-teal-800 transition hover:bg-teal-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {batchRunning ? "Enriching..." : "Enrich Priority Champions"}
+                  </button>
                   <button
                     type="button"
                     onClick={resetToSampleData}
@@ -621,18 +1054,20 @@ export default function Home() {
                     <tr>
                       <th className="px-5 py-4">Rank</th>
                       <th className="px-5 py-4">Person</th>
-                      <th className="px-5 py-4">Job title and company</th>
-                      <th className="px-5 py-4">Segment</th>
-                      <th className="px-5 py-4">Revised score</th>
-                      <th className="px-5 py-4">Qualification tier</th>
-                      <th className="px-5 py-4">Preferred channel</th>
-                      <th className="px-5 py-4">Review status</th>
+                      <th className="px-5 py-4">Unify score</th>
+                      <th className="px-5 py-4">Final score</th>
+                      <th className="px-5 py-4">Final tier</th>
+                      <th className="px-5 py-4">FullEnrich email status</th>
+                      <th className="px-5 py-4">Enrichment status</th>
+                      <th className="px-5 py-4">CRM status</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-sm">
                     {filteredProspects.map((prospect) => {
                       const id = prospectId(prospect);
-                      const status = reviews[id]?.status ?? "Unreviewed";
+                      const enrichmentStatus = enrichmentStates[id]?.status ?? "Not started";
+                      const crmStatus = crmStates[id]?.status ?? (isReadyForCrm(id, reviews, qualificationResults) ? "Ready for CRM" : "Not ready");
+                      const fullEnrichEmailStatus = emailStatusLabel(fullEnrichRecords[id]?.emailStatus);
                       const selected = selectedProspect && id === prospectId(selectedProspect);
 
                       return (
@@ -644,29 +1079,32 @@ export default function Home() {
                           <td className="whitespace-nowrap px-5 py-4 font-semibold text-slate-700">#{value(prospect, "New Rank") || "-"}</td>
                           <td className="whitespace-nowrap px-5 py-4">
                             <div className="font-semibold text-slate-950">{value(prospect, "Person") || "Unnamed prospect"}</div>
-                            <div className="text-xs text-slate-500">{value(prospect, "Email") || "No email captured"}</div>
+                            <div className="text-xs text-slate-500">{value(prospect, "Job Title") || "Unknown title"} at {value(prospect, "Company") || "Unknown company"}</div>
                           </td>
-                          <td className="min-w-64 px-5 py-4 text-slate-600">
-                            <div>{value(prospect, "Job Title") || "Unknown title"}</div>
-                            <div className="text-xs font-medium text-slate-400">{value(prospect, "Company") || "Unknown company"}</div>
-                          </td>
-                          <td className="whitespace-nowrap px-5 py-4 text-slate-600">{value(prospect, "Segment") || "-"}</td>
                           <td className="whitespace-nowrap px-5 py-4">
                             <span className="text-lg font-semibold text-slate-950">{value(prospect, "Revised Score") || "0"}</span>
                           </td>
                           <td className="whitespace-nowrap px-5 py-4">
-                            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${tierBadgeClass(value(prospect, "Qualification Tier"))}`}>
-                              {value(prospect, "Qualification Tier") || "Unqualified"}
+                            <span className="text-lg font-semibold text-slate-950">{finalScoreFor(id, prospect, qualificationResults) || "-"}</span>
+                          </td>
+                          <td className="whitespace-nowrap px-5 py-4">
+                            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${tierBadgeClass(finalTierFor(id, prospect, qualificationResults))}`}>
+                              {finalTierFor(id, prospect, qualificationResults) || "Unqualified"}
                             </span>
                           </td>
                           <td className="whitespace-nowrap px-5 py-4">
-                            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${channelBadgeClass(effectiveChannel(prospect))}`}>
-                              {effectiveChannel(prospect)}
+                            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${statusPillClass(fullEnrichEmailStatus)}`}>
+                              {fullEnrichEmailStatus}
                             </span>
                           </td>
                           <td className="whitespace-nowrap px-5 py-4">
-                            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${reviewBadgeClass(status)}`}>
-                              {status}
+                            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${statusPillClass(enrichmentStatus)}`}>
+                              {enrichmentStatus}
+                            </span>
+                          </td>
+                          <td className="whitespace-nowrap px-5 py-4">
+                            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${statusPillClass(crmStatus)}`}>
+                              {crmStatus}
                             </span>
                           </td>
                         </tr>
@@ -686,10 +1124,25 @@ export default function Home() {
           <aside className="lg:sticky lg:top-6 lg:self-start">
             <ProspectDrawer
               prospect={selectedProspect}
+              unifyProspect={selectedUnifyProspect}
               status={selectedStatus}
               reviewedAt={selectedReviewedAt}
+              enrichmentState={selectedProspect ? enrichmentStates[prospectId(selectedProspect)] : undefined}
+              fullEnrichRecord={selectedProspect ? fullEnrichRecords[prospectId(selectedProspect)] : undefined}
+              qualification={selectedProspect ? qualificationResults[prospectId(selectedProspect)] : undefined}
+              crmState={selectedProspect ? crmStates[prospectId(selectedProspect)] : undefined}
+              demoMode={demoMode}
+              isReadyForCrm={
+                selectedProspect
+                  ? isReadyForCrm(prospectId(selectedProspect), reviews, qualificationResults)
+                  : false
+              }
+              onEnrich={() => selectedProspect && enrichProspect(selectedProspect, false)}
+              onEnrichAndRequalify={() => selectedProspect && enrichProspect(selectedProspect, true)}
+              onRequalify={() => selectedProspect && requalifyProspect(selectedProspect)}
               onApprove={() => setDecision("Approved")}
-              onNeedsReview={() => setDecision("Needs Review")}
+              onSendToZero={() => selectedProspect && sendToZero(selectedProspect)}
+              onRetry={() => selectedProspect && enrichProspect(selectedProspect, true)}
               onReject={() => setDecision("Rejected")}
             />
           </aside>
@@ -731,17 +1184,39 @@ function FilterSelect({
 
 function ProspectDrawer({
   prospect,
+  unifyProspect,
   status,
   reviewedAt,
+  enrichmentState,
+  fullEnrichRecord,
+  qualification,
+  crmState,
+  demoMode,
+  isReadyForCrm,
+  onEnrich,
+  onEnrichAndRequalify,
+  onRequalify,
   onApprove,
-  onNeedsReview,
+  onSendToZero,
+  onRetry,
   onReject,
 }: {
   prospect?: ProspectRow;
+  unifyProspect?: ProspectRow;
   status: ReviewStatus;
   reviewedAt?: string;
+  enrichmentState?: EnrichmentState;
+  fullEnrichRecord?: NormalizedFullEnrichRecord;
+  qualification?: QualificationResult;
+  crmState?: CrmState;
+  demoMode: boolean;
+  isReadyForCrm: boolean;
+  onEnrich: () => void;
+  onEnrichAndRequalify: () => void;
+  onRequalify: () => void;
   onApprove: () => void;
-  onNeedsReview: () => void;
+  onSendToZero: () => void;
+  onRetry: () => void;
   onReject: () => void;
 }) {
   if (!prospect) {
@@ -752,15 +1227,24 @@ function ProspectDrawer({
     );
   }
 
+  const unifyRecord = unifyProspect ?? prospect;
+  const id = prospectId(prospect);
   const scoreItems = [
-    ["Mission Alignment", value(prospect, "Mission Alignment")],
-    ["Network Effect", value(prospect, "Network Effect")],
-    ["High-Stakes Email Need", value(prospect, "High-Stakes Email Need")],
-    ["Evidence Strength", value(prospect, "Evidence Strength")],
-    ["Revised Score", value(prospect, "Revised Score")],
+    ["Unify score", value(unifyRecord, "Revised Score")],
+    ["Final score", qualification?.finalScore ?? "-"],
+    ["Score difference", qualification ? qualification.scoreDifference : "-"],
+    ["Mission", qualification?.missionScore ?? value(unifyRecord, "Mission Alignment")],
+    ["Network", qualification?.networkScore ?? value(unifyRecord, "Network Effect")],
+    ["Communication", qualification?.communicationScore ?? value(unifyRecord, "High-Stakes Email Need")],
   ];
-  const sourceUrl = value(prospect, "Source URL");
-  const linkedinUrl = value(prospect, "LinkedIn URL");
+  const sourceUrl = value(unifyRecord, "Source URL");
+  const linkedinUrl = fullEnrichRecord?.linkedinUrl || value(unifyRecord, "LinkedIn URL");
+  const enrichmentStatus = enrichmentState?.status ?? "Not started";
+  const crmStatus = crmState?.status ?? (isReadyForCrm ? "Ready for CRM" : "Not ready");
+  const finalTier = qualification?.qualificationTier ?? value(unifyRecord, "Qualification Tier");
+  const preferredChannel = qualification?.preferredChannel ?? finalPreferredChannelFor(id, prospect, qualification ? { [id]: qualification } : {});
+  const hasQualification = Boolean(qualification);
+  const canSendToZero = isReadyForCrm && crmStatus !== "Sending" && crmStatus !== "Sent to Zero";
 
   return (
     <div className="overflow-hidden rounded-[1.75rem] border border-white/70 bg-white/95 shadow-2xl shadow-emerald-950/10">
@@ -770,13 +1254,18 @@ function ProspectDrawer({
             <p className="text-sm font-semibold text-emerald-200">Prospect detail</p>
             <h2 className="mt-2 text-2xl font-semibold tracking-tight">{value(prospect, "Person") || "Unnamed prospect"}</h2>
           </div>
-          <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${tierBadgeClass(value(prospect, "Qualification Tier"))}`}>
-            {value(prospect, "Qualification Tier") || "Unqualified"}
+          <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${tierBadgeClass(finalTier)}`}>
+            {finalTier || "Unqualified"}
           </span>
         </div>
         <p className="mt-3 text-sm leading-6 text-slate-300">
           {value(prospect, "Job Title") || "Unknown title"} at {value(prospect, "Company") || "Unknown company"}
         </p>
+        {demoMode && (
+          <div className="mt-4 rounded-2xl border border-amber-300/40 bg-amber-300/10 px-4 py-3 text-sm font-semibold text-amber-100">
+            Demo mode is on. Simulated results display as Simulated demo data.
+          </div>
+        )}
       </div>
 
       <div className="max-h-[calc(100vh-13rem)] overflow-y-auto p-6">
@@ -788,32 +1277,100 @@ function ProspectDrawer({
             </div>
           ))}
           <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
-            <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Email availability</div>
-            <div className="mt-1 text-sm font-semibold text-slate-950">{value(prospect, "Email") || "No email - LinkedIn only"}</div>
+            <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Email validation</div>
+            <div className="mt-1 text-sm font-semibold text-slate-950">{emailStatusLabel(fullEnrichRecord?.emailStatus)}</div>
           </div>
           <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
-            <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Preferred outreach</div>
-            <div className={`mt-2 inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${channelBadgeClass(effectiveChannel(prospect))}`}>
-              {effectiveChannel(prospect)}
+            <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Preferred outreach channel</div>
+            <div className={`mt-2 inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${channelBadgeClass(preferredChannel)}`}>
+              {preferredChannel}
             </div>
           </div>
         </div>
 
-        <DetailBlock title="Exact public signal" body={value(prospect, "Exact Public Signal")} />
-        <DetailBlock title="Direct evidence" body={value(prospect, "Direct Evidence")} />
-        <DetailBlock title="Inferred Lightfern use case" body={value(prospect, "Inferred Use Case")} />
-        <DetailBlock title="Ranking explanation" body={value(prospect, "Position Reason")} />
-        <DetailBlock title="Outreach angle" body={value(prospect, "Outreach Angle")} />
+        <DrawerSection title="Unify discovery data">
+          <DetailBlock title="Exact public signal" body={value(unifyRecord, "Exact Public Signal")} />
+          <DetailBlock title="Direct evidence" body={value(unifyRecord, "Direct Evidence")} />
+          <DetailBlock title="Original qualification tier" body={value(unifyRecord, "Qualification Tier")} />
+          <DetailBlock title="Position reason" body={value(unifyRecord, "Position Reason")} />
+        </DrawerSection>
 
-        <div className="mt-5 grid gap-3">
+        <DrawerSection title="FullEnrich contact enrichment">
+          <div className="grid gap-3 text-sm">
+            <InfoRow label="Status" value={enrichmentStatus} />
+            <InfoRow label="Work email" value={fullEnrichRecord?.workEmail || "Not found"} />
+            <InfoRow label="Personal email fallback" value={fullEnrichRecord?.personalEmail || "Not found"} />
+            <InfoRow label="Email status" value={emailStatusLabel(fullEnrichRecord?.emailStatus)} />
+            <InfoRow label="Phone" value={fullEnrichRecord?.phone || "Not found"} />
+            <InfoRow label="Company domain" value={fullEnrichRecord?.companyDomain || String(prospect["Company Domain"] ?? "") || "Not found"} />
+            <InfoRow label="Location" value={fullEnrichRecord?.location || "Not found"} />
+            {(fullEnrichRecord?.isDemo || enrichmentState?.message === "Simulated demo data") && (
+              <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-800">
+                Simulated demo data
+              </div>
+            )}
+          </div>
+        </DrawerSection>
+
+        <DrawerSection title="Qualification validation">
+          {qualification ? (
+            <div className="space-y-4">
+              <FindingList title="Mission alignment" findings={qualification.missionEvidence} />
+              <FindingList title="Network effect" findings={qualification.networkEvidence} />
+              <FindingList title="Communication need" findings={qualification.communicationEvidence} />
+              <FindingList title="Evidence quality" findings={qualification.evidenceAssessment} />
+              <DetailBlock title="Validation mode" body={qualification.validationMode} />
+              {qualification.qualificationWarnings.length > 0 && (
+                <DetailBlock title="Warnings" body={qualification.qualificationWarnings.join(" ")} />
+              )}
+            </div>
+          ) : (
+            <p className="mt-2 text-sm text-slate-500">Run Requalify or Enrich and Requalify to validate this prospect.</p>
+          )}
+        </DrawerSection>
+
+        <DrawerSection title="Score comparison">
+          <InfoRow label="Unify score" value={value(unifyRecord, "Revised Score") || "0"} />
+          <InfoRow label="Final validated score" value={qualification ? String(qualification.finalScore) : "Not calculated"} />
+          <InfoRow label="Score difference" value={qualification ? String(qualification.scoreDifference) : "Not calculated"} />
+          <InfoRow label="Reason for change" value={qualification?.scoreChangeReason || "Not calculated"} />
+        </DrawerSection>
+
+        <DrawerSection title="Lightfern use case">
+          <DetailBlock title="Use case" body={qualification?.lightfernUseCase || value(unifyRecord, "Inferred Use Case")} />
+          <DetailBlock title="Outreach angle" body={qualification?.outreachAngle || value(unifyRecord, "Outreach Angle")} />
+        </DrawerSection>
+
+        <DrawerSection title="Preferred outreach channel">
+          <div className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${channelBadgeClass(preferredChannel)}`}>
+            {preferredChannel}
+          </div>
+          <p className="mt-2 text-sm text-slate-500">
+            Probably valid email is shown with caution and is not treated as fully verified.
+          </p>
+        </DrawerSection>
+
+        <DrawerSection title="Zero CRM routing">
+          <InfoRow label="CRM status" value={crmStatus} />
+          <InfoRow label="Final tier" value={finalTier || "Not calculated"} />
+          <InfoRow label="Final score" value={qualification ? String(qualification.finalScore) : "Not calculated"} />
+          <InfoRow label="Email validation status" value={emailStatusLabel(fullEnrichRecord?.emailStatus)} />
+          {crmState?.message && (
+            <p className="mt-3 rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-800">
+              {crmState.message} {crmState.isDemo ? "Simulated demo data" : ""}
+            </p>
+          )}
+        </DrawerSection>
+
+        <DrawerSection title="Source URLs">
           <ExternalLink label="Source URL" href={sourceUrl} />
           <ExternalLink label="LinkedIn URL" href={linkedinUrl} />
-        </div>
+        </DrawerSection>
 
         <div className="mt-6 rounded-3xl border border-slate-200 bg-white p-4">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <p className="text-sm font-semibold text-slate-950">Review controls</p>
+              <p className="text-sm font-semibold text-slate-950">Prospect actions</p>
               <p className="mt-1 text-xs text-slate-500">
                 Current status: <span className="font-semibold">{status}</span>
                 {reviewedAt ? ` at ${new Date(reviewedAt).toLocaleString()}` : ""}
@@ -821,17 +1378,62 @@ function ProspectDrawer({
             </div>
           </div>
           <div className="mt-4 grid gap-2">
-            <button type="button" onClick={onApprove} className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-emerald-600/20 transition hover:bg-emerald-700">
+            <button type="button" onClick={onEnrich} className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-800 transition hover:bg-emerald-100">
+              Enrich with FullEnrich
+            </button>
+            <button type="button" onClick={onEnrichAndRequalify} className="rounded-2xl bg-slate-950 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-slate-950/15 transition hover:bg-slate-800">
+              Enrich and Requalify
+            </button>
+            <button type="button" onClick={onRequalify} className="rounded-2xl border border-teal-200 bg-teal-50 px-4 py-3 text-sm font-semibold text-teal-800 transition hover:bg-teal-100">
+              Requalify
+            </button>
+            <button type="button" onClick={onApprove} disabled={!hasQualification} className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-emerald-600/20 transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50">
               Approve
             </button>
-            <button type="button" onClick={onNeedsReview} className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-800 transition hover:bg-amber-100">
-              Needs Review
+            <button type="button" onClick={onSendToZero} disabled={!canSendToZero} className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-semibold text-sky-800 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50">
+              Send to Zero
+            </button>
+            <button type="button" onClick={onRetry} className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-800 transition hover:bg-amber-100">
+              Retry
             </button>
             <button type="button" onClick={onReject} className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-800 transition hover:bg-rose-100">
               Reject
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function DrawerSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="mt-6 rounded-3xl border border-slate-100 bg-white p-4">
+      <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">{title}</h3>
+      <div className="mt-3">{children}</div>
+    </section>
+  );
+}
+
+function InfoRow({ label, value: rowValue }: { label: string; value: string }) {
+  return (
+    <div className="flex items-start justify-between gap-4 rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3">
+      <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">{label}</span>
+      <span className="text-right text-sm font-semibold text-slate-800">{rowValue || "Not available"}</span>
+    </div>
+  );
+}
+
+function FindingList({ title, findings }: { title: string; findings: QualificationResult["missionEvidence"] }) {
+  return (
+    <div>
+      <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">{title}</h4>
+      <div className="mt-2 space-y-2">
+        {findings.map((finding, index) => (
+          <div key={`${title}-${index}`} className="rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+            <span className="font-semibold text-slate-950">{finding.label}:</span> {finding.finding}
+          </div>
+        ))}
       </div>
     </div>
   );
